@@ -11,6 +11,8 @@ import time
 import webbrowser
 import re
 import queue
+import shutil
+import subprocess
 import unicodedata
 import urllib.parse
 import urllib.request
@@ -56,11 +58,20 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
 UPDATE_INTERVAL_S = 24 * 60 * 60  # check once a day
+UPDATE_EXE_NAME = "VamarenStockChecker.exe"
+
+
+def update_download_urls(version):
+    """Where the packaged exe for a given version lives on GitHub."""
+    return [
+        f"{REPO_URL}/releases/download/v{version}/{UPDATE_EXE_NAME}",
+        f"{REPO_URL}/releases/latest/download/{UPDATE_EXE_NAME}",
+    ]
 
 IS_FROZEN = getattr(sys, "frozen", False)  # running as a packaged .exe
 
@@ -499,6 +510,9 @@ class CommanderApp:
                 stale.unlink(missing_ok=True)
             except OSError:
                 pass
+        # Remove the leftover exe from a previous self-update
+        threading.Thread(target=self._cleanup_old_update,
+                         daemon=True).start()
 
     # ---- Style / GUI ----
 
@@ -678,6 +692,112 @@ class CommanderApp:
         if time.time() - last >= UPDATE_INTERVAL_S:
             self.check_for_updates(manual=False)
         self.root.after(UPDATE_INTERVAL_S * 1000, self._auto_update_check)
+
+    # ---- Self update (download new exe, swap, restart) ----
+
+    def _start_self_update(self, version):
+        if not IS_FROZEN:
+            # Running from source: nothing to swap — open the release page
+            webbrowser.open(f"{REPO_URL}/releases/latest")
+            self._set_status("Running from source — update manually")
+            return
+        self.update_btn.config(state="disabled")
+        self._set_status("Downloading update…")
+        threading.Thread(target=self._self_update_worker,
+                         args=(version,), daemon=True).start()
+
+    def _self_update_worker(self, version):
+        tmp = _data_dir() / "update.tmp.exe"
+        try:
+            last_err = None
+            for url in update_download_urls(version):
+                try:
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": BROWSER_UA})
+                    with urllib.request.urlopen(req, timeout=60) as resp, \
+                            open(tmp, "wb") as f:
+                        total = int(resp.headers.get("Content-Length") or 0)
+                        got = 0
+                        while True:
+                            chunk = resp.read(1 << 16)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            got += len(chunk)
+                            if total:
+                                self.msg_queue.put((
+                                    "progress",
+                                    (got / total * 100,
+                                     f"Downloading update… "
+                                     f"{got >> 20} / {total >> 20} MB")))
+                    break
+                except Exception as e:
+                    last_err = e
+            else:
+                raise RuntimeError(f"download failed ({last_err})")
+            # sanity: it must be a real Windows executable
+            with open(tmp, "rb") as f:
+                magic = f.read(2)
+            if magic != b"MZ" or tmp.stat().st_size < 5_000_000:
+                raise RuntimeError("downloaded file is not a valid exe")
+            self.msg_queue.put(("update_ready", str(tmp)))
+        except Exception as e:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.msg_queue.put(("update_failed", str(e)))
+
+    def _apply_update(self, tmp_path):
+        """Swap the running exe for the downloaded one and restart.
+
+        Windows allows renaming a running exe, so: current -> .old,
+        new -> current, launch, exit. The .old file is deleted by the
+        new instance on startup.
+        """
+        current = Path(sys.executable)
+        old = Path(str(current) + ".old")
+        moved = False
+        try:
+            self._set_status("Installing update…")
+            self.root.update_idletasks()
+            try:
+                old.unlink(missing_ok=True)
+            except OSError:
+                pass  # previous .old still locked: replace() below removes it
+            os.replace(current, old)
+            moved = True
+            shutil.move(tmp_path, current)
+            subprocess.Popen([str(current)], close_fds=True)
+            self.root.destroy()
+            os._exit(0)
+        except Exception as e:
+            # roll back so the app keeps working
+            if moved and not current.exists() and old.exists():
+                try:
+                    os.replace(old, current)
+                except OSError:
+                    pass
+            self.update_btn.config(state="normal")
+            self._set_status("Update failed")
+            if messagebox.askyesno(
+                    "Update failed",
+                    f"Could not install the update:\n{e}\n\n"
+                    "Open the download page instead?"):
+                webbrowser.open(f"{REPO_URL}/releases/latest")
+
+    @staticmethod
+    def _cleanup_old_update():
+        """Remove the leftover .old exe from a previous self-update."""
+        if not IS_FROZEN:
+            return
+        old = Path(str(Path(sys.executable)) + ".old")
+        for _ in range(3):
+            try:
+                old.unlink(missing_ok=True)
+                return
+            except OSError:
+                time.sleep(1.0)  # old instance may still be exiting
 
     # ---- Logo ----
 
@@ -1327,12 +1447,22 @@ class CommanderApp:
                             "Update available",
                             f"Version {payload} is available "
                             f"(you have v{APP_VERSION}).\n\n"
-                            "Open the download page?"):
-                        webbrowser.open(REPO_URL)
+                            "Update now?"):
+                        self._start_self_update(payload)
                 elif kind == "update_none":
                     self._set_status(f"Up to date (v{APP_VERSION})")
                 elif kind == "update_error":
                     self._set_status("Update check failed")
+                elif kind == "update_ready":
+                    self._apply_update(payload)
+                elif kind == "update_failed":
+                    self.update_btn.config(state="normal")
+                    self._set_status("Update failed")
+                    if messagebox.askyesno(
+                            "Update failed",
+                            f"Could not update automatically:\n{payload}\n\n"
+                            "Open the download page instead?"):
+                        webbrowser.open(f"{REPO_URL}/releases/latest")
         except queue.Empty:
             pass
         self.root.after(100, self._process_queue)
