@@ -52,7 +52,7 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
@@ -478,7 +478,7 @@ class CommanderApp:
         self.update_thread = None
         self.msg_queue = queue.Queue()
         self.cart_names = set()  # normalized names currently in the cart
-        self.show_images = tk.BooleanVar(value=True)
+        self.show_images = tk.BooleanVar(value=False)  # text mode default
         self.import_mode = tk.BooleanVar(value=False)
         self._logo_photo = None
         self._resize_after = None
@@ -820,40 +820,68 @@ class CommanderApp:
     # ---- Async workers ----
 
     async def _scryfall_throttle(self):
-        """Global pacing so Scryfall API calls stay under its rate limit."""
+        """Global pacing so Scryfall API calls stay under its rate limit.
+
+        Also enforces a shared cooldown: when any request gets a 429, ALL
+        Scryfall traffic pauses until the cooldown expires. (Previously each
+        task backed off alone while the rest kept firing, which continually
+        extended the server-side block and stalled big deck checks.)
+        """
         lock = getattr(self, "_scry_lock", None)
         if lock is None:
             lock = self._scry_lock = asyncio.Lock()
             self._scry_last = 0.0
+            self._scry_cooldown_until = 0.0
         async with lock:
             loop = asyncio.get_event_loop()
-            now = loop.time()
-            wait = self._scry_last + SCRYFALL_MIN_INTERVAL - now
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._scry_last = max(now, self._scry_last
-                                  + SCRYFALL_MIN_INTERVAL)
+            while not self.cancel_event.is_set():
+                now = loop.time()
+                pause = max(self._scry_cooldown_until - now,
+                            self._scry_last + SCRYFALL_MIN_INTERVAL - now)
+                if pause <= 0:
+                    break
+                # short slices so Cancel stays responsive during cooldowns
+                await asyncio.sleep(min(pause, 0.5))
+            self._scry_last = loop.time()
+
+    def _scryfall_backoff(self, delay):
+        """Start/extend the shared cooldown after a 429."""
+        loop = asyncio.get_event_loop()
+        until = loop.time() + delay
+        if until > getattr(self, "_scry_cooldown_until", 0.0):
+            self._scry_cooldown_until = until
+            self.msg_queue.put((
+                "status", f"Scryfall rate limit — pausing {int(delay)}s…"))
 
     async def _scryfall_get(self, session, url):
         """Rate-limited Scryfall API GET with 429 retry. Returns JSON/None."""
-        for attempt in range(4):
+        for attempt in range(6):
+            if self.cancel_event.is_set():
+                return None
             await self._scryfall_throttle()
+            status, retry_after = None, None
             try:
-                async with session.get(url, headers=SCRYFALL_HEADERS) as r:
-                    if r.status == 429:
-                        # Scryfall cooldowns can run ~25s; honor them
-                        retry = r.headers.get("Retry-After")
-                        try:
-                            delay = min(float(retry), 30.0) if retry else 0.6
-                        except ValueError:
-                            delay = 0.6
-                        await asyncio.sleep(delay + 0.3 * attempt)
-                        continue
-                    if r.status == 200:
+                async with session.get(
+                        url, headers=SCRYFALL_HEADERS,
+                        timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    status = r.status
+                    if status == 200:
                         return await r.json()
-                    return None
+                    retry_after = r.headers.get("Retry-After")
             except Exception:
-                await asyncio.sleep(0.4 * (attempt + 1))
+                pass  # timeout/network hiccup -> retry below
+            if status == 429:
+                try:
+                    delay = (min(float(retry_after), 60.0)
+                             if retry_after else 2.0)
+                except ValueError:
+                    delay = 2.0
+                # Connection is released here; everyone waits together
+                self._scryfall_backoff(delay + 0.5)
+                continue
+            if status is not None:
+                return None  # 404 etc. -> no retry
+            await asyncio.sleep(0.5 * (attempt + 1))
         return None
 
     async def _scryfall_named(self, session, name, set_code=None):
@@ -878,7 +906,9 @@ class CommanderApp:
         for attempt in range(3):
             try:
                 async with session.get(img_uris["normal"],
-                                       headers=SCRYFALL_HEADERS) as r:
+                                       headers=SCRYFALL_HEADERS,
+                                       timeout=aiohttp.ClientTimeout(
+                                           total=30)) as r:
                     if r.status == 200:
                         return await r.read()
                     if r.status == 429:
@@ -1481,14 +1511,20 @@ class CommanderApp:
 
         link = store_search_url(card["name"])
         widget = None
-        photo = card.get("_photo")  # cached thumbnail (instant re-render)
+        in_cart = normalize_card_name(card["name"]) in self.cart_names
+        # cached thumbnail; rebuilt when the in-cart state changes
+        photo = (card.get("_photo")
+                 if card.get("_photo_cart") == in_cart else None)
         if photo is None and card.get("image_bytes"):
             try:
                 img = Image.open(BytesIO(card["image_bytes"])).resize(
                     (CARD_W, CARD_H), Image.LANCZOS)
                 self._draw_stock_badge(img, card.get("in_stock"))
+                if in_cart:
+                    self._draw_cart_check(img)
                 photo = ImageTk.PhotoImage(img)
                 card["_photo"] = photo
+                card["_photo_cart"] = in_cart
             except Exception:
                 photo = None
         if photo is not None:
@@ -1529,9 +1565,6 @@ class CommanderApp:
                 font=FONT_SMALL, cursor="hand2").pack(side="left", padx=4)
         tk.Label(bottom, text=qty_text, font=FONT_SMALL, bg=C["card"],
                  fg=C["muted"]).pack(side="right", padx=6)
-        if normalize_card_name(card["name"]) in self.cart_names:
-            tk.Label(frame, text="✓ IN CART", font=("Segoe UI", 8, "bold"),
-                     bg=C["card"], fg=C["green"]).pack(pady=(0, 3))
 
     def _render_name_card(self, card, idx, per_row):
         frame = tk.Frame(self.card_frame, bg=C["card"], padx=8, pady=5)
@@ -1557,14 +1590,14 @@ class CommanderApp:
         name_lbl = tk.Label(frame, text=name_text,
                             font=FONT, bg=C["card"], fg=C["text"],
                             cursor="hand2", anchor="w")
-        name_lbl.pack(side="left", padx=(6, 0), fill="x", expand=True)
+        name_lbl.pack(side="left", padx=(6, 0))
         name_lbl.bind("<Button-1>", lambda e, u=link: webbrowser.open(u))
         name_lbl.bind("<Enter>",
                       lambda e: name_lbl.config(fg=C["accent_hi"]))
         name_lbl.bind("<Leave>", lambda e: name_lbl.config(fg=C["text"]))
         if normalize_card_name(card["name"]) in self.cart_names:
-            tk.Label(frame, text="✓ IN CART", font=("Segoe UI", 8, "bold"),
-                     bg=C["card"], fg=C["green"]).pack(side="right", padx=4)
+            tk.Label(frame, text="✓ in cart", font=("Segoe UI", 9, "bold"),
+                     bg=C["card"], fg=C["green"]).pack(side="left", padx=6)
         if card.get("image_bytes"):
             HoverPreview(name_lbl, card["image_bytes"])
 
@@ -1575,6 +1608,17 @@ class CommanderApp:
         symbol = "✔" if in_stock else "✕"
         draw.ellipse([6, 6, 28, 28], fill=color, outline="white", width=1)
         draw.text((12, 8), symbol, fill="white")
+
+    @staticmethod
+    def _draw_cart_check(img):
+        """Large green check, top-right: this card is already in the cart."""
+        draw = ImageDraw.Draw(img)
+        w = img.width
+        draw.ellipse([w - 42, 4, w - 4, 42], fill=C["green"],
+                     outline="white", width=2)
+        # bold white check mark
+        draw.line([(w - 33, 23), (w - 26, 31), (w - 12, 13)],
+                  fill="white", width=5, joint="curve")
 
     # ---- Shutdown ----
 
