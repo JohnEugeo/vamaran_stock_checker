@@ -56,7 +56,7 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.3.0"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
@@ -493,8 +493,12 @@ class CommanderApp:
         self._create_gui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._process_queue)
-        self.root.after(1500, self._refresh_cart)
         self.root.after(3000, self._auto_update_check)
+
+        # Indicators are purely app-side: restore them from the local record
+        self.cart_names = self._local_cart_names()
+        if self.cart_names:
+            self._set_status(f"{len(self.cart_names)} card(s) in cart")
 
     # ---- Style / GUI ----
 
@@ -1216,17 +1220,30 @@ class CommanderApp:
         except Exception:
             pass
 
-    @staticmethod
-    def _load_cart_state():
-        try:
-            return json.loads(CART_STATE_FILE.read_text("utf-8"))
-        except Exception:
-            return {}
+    # The "in cart" indicators are purely app-side: a local list of card
+    # names the user added through the app. The website's cart session is
+    # only touched when adding (Add to Cart) or clearing (Clear Cart).
 
     @staticmethod
-    def _save_cart_state(state):
+    def _load_cart_state():
+        """Local list of card display names marked as in-cart."""
         try:
-            CART_STATE_FILE.write_text(json.dumps(state), "utf-8")
+            data = json.loads(CART_STATE_FILE.read_text("utf-8"))
+        except Exception:
+            return []
+        if isinstance(data, dict):
+            if isinstance(data.get("names"), list):
+                return [str(n) for n in data["names"]]
+            # legacy sku -> {name} format
+            return [v.get("name") for v in data.values()
+                    if isinstance(v, dict) and v.get("name")]
+        return []
+
+    @staticmethod
+    def _save_cart_state(names):
+        try:
+            CART_STATE_FILE.write_text(
+                json.dumps({"names": sorted(set(names))}), "utf-8")
         except OSError:
             pass
 
@@ -1244,13 +1261,9 @@ class CommanderApp:
         except Exception:
             return []
 
-    def _cart_names_from_state(self, items):
-        """Card names in the cart + prune stale sku->name state entries."""
-        state = self._load_cart_state()
-        in_cart = {str(i.get("skuId")) for i in items}
-        state = {k: v for k, v in state.items() if k in in_cart}
-        self._save_cart_state(state)
-        return {normalize_card_name(v["name"]) for v in state.values()}
+    def _local_cart_names(self):
+        """Normalized in-cart names from the app's own record."""
+        return {normalize_card_name(n) for n in self._load_cart_state()}
 
     async def _cart_checkout_url(self, session):
         """The store's sign-in/checkout URL for this cart session."""
@@ -1268,8 +1281,8 @@ class CommanderApp:
 
     async def _cart_add_worker(self, selections):
         added, problems = 0, []
+        added_names = []
         async with self._cart_session() as session:
-            state = self._load_cart_state()
             for i, sel in enumerate(selections):
                 self.msg_queue.put((
                     "status",
@@ -1309,8 +1322,7 @@ class CommanderApp:
                             pass
                         if r.status == 200 and not body.get("errors"):
                             added += 1
-                            state[str(sku["skuId"])] = {"name": sel["name"],
-                                                        "qty": qty}
+                            added_names.append(sel["name"])
                             if qty < sel["qty"]:
                                 problems.append(
                                     f"{sel['name']}: only {qty} of "
@@ -1321,48 +1333,41 @@ class CommanderApp:
                 except Exception as e:
                     problems.append(f"{sel['name']}: {e}")
 
-            self._save_cart_state(state)
-            items = await self._cart_items(session)
             checkout = await self._cart_checkout_url(session)
             self._save_cart_cookies(session)
 
+        # Record locally — indicators are app-side only
+        names = self._load_cart_state() + added_names
+        self._save_cart_state(names)
         self.msg_queue.put(("cart_state",
-                            self._cart_names_from_state(items)))
+                            {normalize_card_name(n) for n in names}))
         self.msg_queue.put(("cart_done", (added, len(selections), problems)))
         if added:
             webbrowser.open(checkout)  # user's default browser
 
     async def _cart_clear_worker(self):
-        async with self._cart_session() as session:
-            items = await self._cart_items(session)
-            for item in items:
-                try:
-                    await session.post(
-                        f"{STORE_BASE}/api/cart/items",
-                        json={"skuId": item.get("skuId"),
-                              "storePriceCustomId":
-                                  item.get("storePriceCustomId"),
-                              "condition": item.get("condition",
-                                                    "Near Mint"),
-                              "quantity": 0})
-                except Exception:
-                    pass
-            remaining = await self._cart_items(session)
-            self._save_cart_cookies(session)
-        self._save_cart_state({})
-        self.msg_queue.put(("cart_state",
-                            self._cart_names_from_state(remaining)))
-        self.msg_queue.put(("status",
-                            "Cart cleared" if not remaining
-                            else f"Cart: {len(remaining)} items left"))
-
-    async def _cart_refresh_worker(self):
-        """Startup sync: which cards are already in the cart?"""
-        async with self._cart_session() as session:
-            items = await self._cart_items(session)
-            self._save_cart_cookies(session)
-        self.msg_queue.put(("cart_state",
-                            self._cart_names_from_state(items)))
+        """Clear the in-app indicators and (best effort) the website cart."""
+        try:
+            async with self._cart_session() as session:
+                items = await self._cart_items(session)
+                for item in items:
+                    try:
+                        await session.post(
+                            f"{STORE_BASE}/api/cart/items",
+                            json={"skuId": item.get("skuId"),
+                                  "storePriceCustomId":
+                                      item.get("storePriceCustomId"),
+                                  "condition": item.get("condition",
+                                                        "Near Mint"),
+                                  "quantity": 0})
+                    except Exception:
+                        pass
+                self._save_cart_cookies(session)
+        except Exception:
+            pass  # website unreachable: indicators still clear locally
+        self._save_cart_state([])
+        self.msg_queue.put(("cart_state", set()))
+        self.msg_queue.put(("status", "Cart cleared"))
 
     def _selected_cards(self):
         return [c for c in self.deck_cards
@@ -1409,11 +1414,6 @@ class CommanderApp:
             target=self._run_cart_op,
             args=(self._cart_clear_worker(),), daemon=True)
         self.cart_thread.start()
-
-    def _refresh_cart(self):
-        threading.Thread(target=self._run_cart_op,
-                         args=(self._cart_refresh_worker(),),
-                         daemon=True).start()
 
     def _run_cart_op(self, coro):
         loop = asyncio.new_event_loop()
@@ -1487,8 +1487,7 @@ class CommanderApp:
                 elif kind == "cart_state":
                     self.cart_names = payload
                     if payload:
-                        self._set_status(
-                            f"{len(payload)} card(s) in store cart")
+                        self._set_status(f"{len(payload)} card(s) in cart")
                     if self.deck_cards:
                         self._redisplay()
                 elif kind == "cart_done":
