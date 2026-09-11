@@ -56,7 +56,7 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
@@ -1648,6 +1648,9 @@ class CommanderApp:
                 fg=C["text"], activebackground=C["card"],
                 activeforeground=C["text"], selectcolor=C["input_bg"],
                 font=FONT_SMALL, cursor="hand2").pack(side="left", padx=4)
+        if in_cart:
+            tk.Label(bottom, text="in cart", font=("Segoe UI", 9, "bold"),
+                     bg=C["card"], fg=C["green"]).pack(side="left", padx=2)
         tk.Label(bottom, text=qty_text, font=FONT_SMALL, bg=C["card"],
                  fg=C["muted"]).pack(side="right", padx=6)
 
@@ -1681,7 +1684,7 @@ class CommanderApp:
                       lambda e: name_lbl.config(fg=C["accent_hi"]))
         name_lbl.bind("<Leave>", lambda e: name_lbl.config(fg=C["text"]))
         if normalize_card_name(card["name"]) in self.cart_names:
-            tk.Label(frame, text="✓ in cart", font=("Segoe UI", 9, "bold"),
+            tk.Label(frame, text="in cart", font=("Segoe UI", 10, "bold"),
                      bg=C["card"], fg=C["green"]).pack(side="left", padx=6)
         if card.get("image_bytes"):
             HoverPreview(name_lbl, card["image_bytes"])
@@ -1696,8 +1699,7 @@ class CommanderApp:
 
     @staticmethod
     def _draw_cart_check(img):
-        """Large green check + 'in cart' tag, top-right of the card art."""
-        from PIL import ImageFont
+        """Large green check, top-right: this card is already in the cart."""
         draw = ImageDraw.Draw(img)
         w = img.width
         draw.ellipse([w - 42, 4, w - 4, 42], fill=C["green"],
@@ -1705,21 +1707,6 @@ class CommanderApp:
         # bold white check mark
         draw.line([(w - 33, 23), (w - 26, 31), (w - 12, 13)],
                   fill="white", width=5, joint="curve")
-        # "in cart" pill right under the circle
-        try:
-            font = ImageFont.truetype("arialbd.ttf", 12)
-        except OSError:
-            font = ImageFont.load_default()
-        text = "in cart"
-        box = draw.textbbox((0, 0), text, font=font)
-        tw, th = box[2] - box[0], box[3] - box[1]
-        cx = w - 23  # center of the circle
-        x0, y0 = cx - tw // 2 - 5, 46
-        x1, y1 = cx + tw // 2 + 5, 46 + th + 8
-        draw.rounded_rectangle([x0, y0, x1, y1], radius=7,
-                               fill=C["green"], outline="white", width=1)
-        draw.text((cx - tw // 2 - box[0], y0 + 4 - box[1]), text,
-                  font=font, fill="white")
 
     # ---- Shutdown ----
 
