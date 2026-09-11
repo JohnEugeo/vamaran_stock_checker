@@ -5,6 +5,8 @@ from tkinter import ttk, messagebox
 import threading
 import asyncio
 import json
+import os
+import sys
 import time
 import webbrowser
 import re
@@ -47,9 +49,31 @@ APP_VERSION = "1.0.0"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
-UPDATE_STAMP_FILE = Path(__file__).with_name(".last_update_check")
 UPDATE_INTERVAL_S = 24 * 60 * 60  # check once a day
-LOGO_FILE = Path(__file__).with_name("vamaren_logo.png")
+
+IS_FROZEN = getattr(sys, "frozen", False)  # running as a packaged .exe
+
+
+def _data_dir() -> Path:
+    """Writable directory for cache/settings (survives exe restarts)."""
+    if IS_FROZEN:
+        d = Path(os.environ.get("LOCALAPPDATA",
+                                Path.home())) / "VamarenStockChecker"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return Path(__file__).parent
+
+
+def _bundled(name: str) -> Path:
+    """Path of a resource bundled inside the exe (read-only)."""
+    if IS_FROZEN and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / name
+    return Path(__file__).with_name(name)
+
+
+UPDATE_STAMP_FILE = _data_dir() / ".last_update_check"
+LOGO_FILE = _data_dir() / "vamaren_logo.png"
+BUNDLED_LOGO = _bundled("vamaren_logo.png")
 # Official store logo (fallback download if the local file is missing)
 LOGO_URL = ("https://storefronts-assets.tcgplayer.com/media/"
             "41efd73f-64c7-475f-ab12-3567c58e6c51/"
@@ -637,10 +661,11 @@ class CommanderApp:
     # ---- Logo ----
 
     def _load_logo(self):
-        if LOGO_FILE.exists():
-            self._set_logo_from_bytes(LOGO_FILE.read_bytes())
-        else:
-            threading.Thread(target=self._download_logo, daemon=True).start()
+        for path in (BUNDLED_LOGO, LOGO_FILE):
+            if path.exists():
+                self._set_logo_from_bytes(path.read_bytes())
+                return
+        threading.Thread(target=self._download_logo, daemon=True).start()
 
     def _download_logo(self):
         try:
