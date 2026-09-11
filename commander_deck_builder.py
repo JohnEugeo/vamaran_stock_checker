@@ -26,6 +26,13 @@ import aiohttp
 MAX_CARDS = 100
 CONCURRENCY_LIMIT = 6
 SCRYFALL_CARD = "https://api.scryfall.com/cards/named?fuzzy="
+# Scryfall asks for <=10 requests/sec with UA + Accept headers; going
+# faster returns 429s, which was breaking card images on big decks.
+SCRYFALL_MIN_INTERVAL = 0.12
+SCRYFALL_HEADERS = {
+    "User-Agent": "VamarenStockChecker/1.1",
+    "Accept": "application/json;q=0.9,*/*;q=0.8",
+}
 STORE_BASE = "https://vamaren.tcgplayerpro.com"
 # Same JSON endpoint the storefront's search page uses. Returns
 # products.totalItems, which matches the visible "N results for" count
@@ -45,7 +52,7 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
@@ -74,6 +81,9 @@ def _bundled(name: str) -> Path:
 UPDATE_STAMP_FILE = _data_dir() / ".last_update_check"
 LOGO_FILE = _data_dir() / "vamaren_logo.png"
 BUNDLED_LOGO = _bundled("vamaren_logo.png")
+# Persistent store-cart session (cookies) + sku->card-name map
+CART_COOKIE_FILE = _data_dir() / "cart_cookies.dat"
+CART_STATE_FILE = _data_dir() / "cart_state.json"
 # Official store logo (fallback download if the local file is missing)
 LOGO_URL = ("https://storefronts-assets.tcgplayer.com/media/"
             "41efd73f-64c7-475f-ab12-3567c58e6c51/"
@@ -467,6 +477,7 @@ class CommanderApp:
         self.cart_thread = None
         self.update_thread = None
         self.msg_queue = queue.Queue()
+        self.cart_names = set()  # normalized names currently in the cart
         self.show_images = tk.BooleanVar(value=True)
         self.import_mode = tk.BooleanVar(value=False)
         self._logo_photo = None
@@ -478,6 +489,7 @@ class CommanderApp:
         self._create_gui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._process_queue)
+        self.root.after(1500, self._refresh_cart)
         self.root.after(3000, self._auto_update_check)
 
     # ---- Style / GUI ----
@@ -558,7 +570,8 @@ class CommanderApp:
                                      C["accent"], C["accent_hi"])
         self.build_btn.pack(side="left")
 
-        self.cancel_btn = flat_button(bar, "Cancel", self.cancel_build,
+        # "Cancel" while a check is running, "Clear Cart" when idle
+        self.cancel_btn = flat_button(bar, "Clear Cart", self.start_clear_cart,
                                       C["danger"], C["danger_hi"])
         self.cancel_btn.pack(side="left", padx=(8, 0))
 
@@ -774,6 +787,7 @@ class CommanderApp:
             w.destroy()
         self._set_status("Starting…")
         self.build_btn.config(state="disabled")
+        self._set_cancel_mode(running=True)
 
         self.build_thread = threading.Thread(
             target=self._run_async_build, args=(entries,), daemon=True)
@@ -783,8 +797,17 @@ class CommanderApp:
         self.cancel_event.set()
         self._set_status("Cancelling…")
 
+    def _set_cancel_mode(self, running):
+        """The red button cancels during a check, clears the cart when idle."""
+        if running:
+            self.cancel_btn.config(text="Cancel", command=self.cancel_build)
+        else:
+            self.cancel_btn.config(text="Clear Cart",
+                                   command=self.start_clear_cart)
+
     def _run_async_build(self, entries):
         loop = asyncio.new_event_loop()
+        self._scry_lock = None  # throttle lock is bound to the new loop
         try:
             asyncio.set_event_loop(loop)
             loop.run_until_complete(self._build(entries))
@@ -796,33 +819,74 @@ class CommanderApp:
 
     # ---- Async workers ----
 
-    @staticmethod
-    async def _scryfall_named(session, name, set_code=None):
+    async def _scryfall_throttle(self):
+        """Global pacing so Scryfall API calls stay under its rate limit."""
+        lock = getattr(self, "_scry_lock", None)
+        if lock is None:
+            lock = self._scry_lock = asyncio.Lock()
+            self._scry_last = 0.0
+        async with lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            wait = self._scry_last + SCRYFALL_MIN_INTERVAL - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._scry_last = max(now, self._scry_last
+                                  + SCRYFALL_MIN_INTERVAL)
+
+    async def _scryfall_get(self, session, url):
+        """Rate-limited Scryfall API GET with 429 retry. Returns JSON/None."""
+        for attempt in range(4):
+            await self._scryfall_throttle()
+            try:
+                async with session.get(url, headers=SCRYFALL_HEADERS) as r:
+                    if r.status == 429:
+                        # Scryfall cooldowns can run ~25s; honor them
+                        retry = r.headers.get("Retry-After")
+                        try:
+                            delay = min(float(retry), 30.0) if retry else 0.6
+                        except ValueError:
+                            delay = 0.6
+                        await asyncio.sleep(delay + 0.3 * attempt)
+                        continue
+                    if r.status == 200:
+                        return await r.json()
+                    return None
+            except Exception:
+                await asyncio.sleep(0.4 * (attempt + 1))
+        return None
+
+    async def _scryfall_named(self, session, name, set_code=None):
         """Scryfall named-card lookup, optionally pinned to a set code."""
         url = SCRYFALL_CARD + urllib.parse.quote(name)
         if set_code:
             url += "&set=" + urllib.parse.quote(set_code)
-        try:
-            async with session.get(url) as r:
-                if r.status == 200:
-                    return await r.json()
-        except Exception:
-            pass
-        return None
+        return await self._scryfall_get(session, url)
 
     @staticmethod
     async def _fetch_card_image(session, data):
-        """Download the 'normal' image for a Scryfall card object."""
+        """Download the 'normal' image for a Scryfall card object.
+
+        Image files live on Scryfall's CDN (not rate limited), but retry
+        a couple of times so transient failures don't drop card art.
+        """
         img_uris = data.get("image_uris")
         if not img_uris and data.get("card_faces"):
             img_uris = data["card_faces"][0].get("image_uris")
-        if img_uris and img_uris.get("normal"):
+        if not img_uris or not img_uris.get("normal"):
+            return None
+        for attempt in range(3):
             try:
-                async with session.get(img_uris["normal"]) as r:
+                async with session.get(img_uris["normal"],
+                                       headers=SCRYFALL_HEADERS) as r:
                     if r.status == 200:
                         return await r.read()
+                    if r.status == 429:
+                        await asyncio.sleep(0.6 + 0.4 * attempt)
+                        continue
+                    return None
             except Exception:
-                pass
+                await asyncio.sleep(0.4 * (attempt + 1))
         return None
 
     async def _fetch_card(self, session, entry):
@@ -853,12 +917,8 @@ class CommanderApp:
         url = ("https://api.scryfall.com/cards/search"
                "?unique=prints&order=released&q="
                + urllib.parse.quote(f'!"{name}"'))
-        try:
-            async with session.get(url) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-        except Exception:
+        data = await self._scryfall_get(session, url)
+        if not data:
             return None
         for printing in data.get("data", []):
             set_name = printing.get("set_name", "")
@@ -1021,30 +1081,80 @@ class CommanderApp:
         matching = [s for s in avail if bool(s.get("isFoil")) == want_foil]
         return min(matching or avail, key=price)
 
-    async def _cart_worker(self, selections, headless=False, keep_open=True):
-        """Add selected cards to a real store cart in a visible browser.
+    # The store cart is a plain HTTP API tied to a session cookie. The app
+    # keeps its own persistent cart session (no Playwright involved) and
+    # opens the user's DEFAULT browser on the store's checkout handoff URL.
 
-        The cart is tied to browser cookies, so items are added inside a
-        Chromium window the user keeps to complete checkout.
-        """
+    def _cart_session(self):
+        jar = aiohttp.CookieJar()
+        if CART_COOKIE_FILE.exists():
+            try:
+                jar.load(str(CART_COOKIE_FILE))
+            except Exception:
+                pass
+        return aiohttp.ClientSession(headers=STORE_HEADERS, cookie_jar=jar)
+
+    @staticmethod
+    def _save_cart_cookies(session):
         try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            self.msg_queue.put(("cart_error",
-                                "Add to cart needs the 'playwright' package:"
-                                "\npip install playwright && "
-                                "playwright install chromium"))
-            return
-        added, problems = 0, []
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=headless, args=["--start-maximized"])
-            ctx = await browser.new_context(user_agent=BROWSER_UA,
-                                            no_viewport=not headless)
-            page = await ctx.new_page()
-            await page.goto(STORE_BASE, timeout=30000,
-                            wait_until="domcontentloaded")
+            session.cookie_jar.save(str(CART_COOKIE_FILE))
+        except Exception:
+            pass
 
+    @staticmethod
+    def _load_cart_state():
+        try:
+            return json.loads(CART_STATE_FILE.read_text("utf-8"))
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_cart_state(state):
+        try:
+            CART_STATE_FILE.write_text(json.dumps(state), "utf-8")
+        except OSError:
+            pass
+
+    @staticmethod
+    async def _cart_items(session):
+        """Current items in the store cart: [{skuId, quantity, ...}]."""
+        try:
+            async with session.get(
+                    f"{STORE_BASE}/api/cart",
+                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200:
+                    return []
+                data = await r.json()
+                return data.get("cartItems") or []
+        except Exception:
+            return []
+
+    def _cart_names_from_state(self, items):
+        """Card names in the cart + prune stale sku->name state entries."""
+        state = self._load_cart_state()
+        in_cart = {str(i.get("skuId")) for i in items}
+        state = {k: v for k, v in state.items() if k in in_cart}
+        self._save_cart_state(state)
+        return {normalize_card_name(v["name"]) for v in state.values()}
+
+    async def _cart_checkout_url(self, session):
+        """The store's sign-in/checkout URL for this cart session."""
+        try:
+            async with session.get(f"{STORE_BASE}/tcgplayer/cart",
+                                   allow_redirects=False,
+                                   timeout=aiohttp.ClientTimeout(
+                                       total=15)) as r:
+                loc = r.headers.get("Location")
+                if loc:
+                    return loc
+        except Exception:
+            pass
+        return f"{STORE_BASE}/tcgplayer/cart"
+
+    async def _cart_add_worker(self, selections):
+        added, problems = 0, []
+        async with self._cart_session() as session:
+            state = self._load_cart_state()
             for i, sel in enumerate(selections):
                 self.msg_queue.put((
                     "status",
@@ -1055,60 +1165,89 @@ class CommanderApp:
                     if not product or not product.get("id"):
                         problems.append(f"{sel['name']}: no listing found")
                         continue
-                    r = await page.request.get(
-                        f"{STORE_BASE}/api/inventory/skus"
-                        f"?productIds={product['id']}")
-                    if r.status != 200:
-                        problems.append(f"{sel['name']}: sku lookup failed")
-                        continue
-                    groups = await r.json()
+                    async with session.get(
+                            f"{STORE_BASE}/api/inventory/skus"
+                            f"?productIds={product['id']}") as r:
+                        if r.status != 200:
+                            problems.append(
+                                f"{sel['name']}: sku lookup failed")
+                            continue
+                        groups = await r.json()
                     skus = groups[0].get("skus", []) if groups else []
                     sku = self._pick_sku(skus, sel["foil"])
                     if not sku:
                         problems.append(f"{sel['name']}: sold out")
                         continue
                     qty = min(sel["qty"], sku.get("quantity") or 1)
-                    resp = await page.request.post(
-                        f"{STORE_BASE}/api/cart/items",
-                        data={"skuId": sku["skuId"],
-                              "storePriceCustomId":
-                                  sku.get("storePriceCustomId") or None,
-                              "condition": sku.get("conditionName",
-                                                   "Near Mint"),
-                              "quantity": qty})
-                    body = {}
-                    try:
-                        body = await resp.json()
-                    except Exception:
-                        pass
-                    if resp.status == 200 and not body.get("errors"):
-                        added += 1
-                        if qty < sel["qty"]:
+                    async with session.post(
+                            f"{STORE_BASE}/api/cart/items",
+                            json={"skuId": sku["skuId"],
+                                  "storePriceCustomId":
+                                      sku.get("storePriceCustomId") or None,
+                                  "condition": sku.get("conditionName",
+                                                       "Near Mint"),
+                                  "quantity": qty}) as r:
+                        body = {}
+                        try:
+                            body = await r.json()
+                        except Exception:
+                            pass
+                        if r.status == 200 and not body.get("errors"):
+                            added += 1
+                            state[str(sku["skuId"])] = {"name": sel["name"],
+                                                        "qty": qty}
+                            if qty < sel["qty"]:
+                                problems.append(
+                                    f"{sel['name']}: only {qty} of "
+                                    f"{sel['qty']} available")
+                        else:
                             problems.append(
-                                f"{sel['name']}: only {qty} of "
-                                f"{sel['qty']} available")
-                    else:
-                        problems.append(f"{sel['name']}: store rejected add")
+                                f"{sel['name']}: store rejected add")
                 except Exception as e:
                     problems.append(f"{sel['name']}: {e}")
 
-            # Store cart page (prompts TCGplayer sign-in for checkout;
-            # the cart itself is already attached to this browser session)
-            await page.goto(f"{STORE_BASE}/tcgplayer/cart", timeout=30000,
-                            wait_until="domcontentloaded")
-            self.msg_queue.put(("cart_done", (added, len(selections),
-                                              problems)))
-            if keep_open:
-                # Keep the window alive until the user closes it
-                disconnected = asyncio.Event()
-                browser.on("disconnected",
-                           lambda *_: disconnected.set())
+            self._save_cart_state(state)
+            items = await self._cart_items(session)
+            checkout = await self._cart_checkout_url(session)
+            self._save_cart_cookies(session)
+
+        self.msg_queue.put(("cart_state",
+                            self._cart_names_from_state(items)))
+        self.msg_queue.put(("cart_done", (added, len(selections), problems)))
+        if added:
+            webbrowser.open(checkout)  # user's default browser
+
+    async def _cart_clear_worker(self):
+        async with self._cart_session() as session:
+            items = await self._cart_items(session)
+            for item in items:
                 try:
-                    while len(ctx.pages) > 0 and not disconnected.is_set():
-                        await asyncio.sleep(0.5)
+                    await session.post(
+                        f"{STORE_BASE}/api/cart/items",
+                        json={"skuId": item.get("skuId"),
+                              "storePriceCustomId":
+                                  item.get("storePriceCustomId"),
+                              "condition": item.get("condition",
+                                                    "Near Mint"),
+                              "quantity": 0})
                 except Exception:
                     pass
-            await browser.close()
+            remaining = await self._cart_items(session)
+            self._save_cart_cookies(session)
+        self._save_cart_state({})
+        self.msg_queue.put(("cart_state",
+                            self._cart_names_from_state(remaining)))
+        self.msg_queue.put(("status",
+                            "Cart cleared" if not remaining
+                            else f"Cart: {len(remaining)} items left"))
+
+    async def _cart_refresh_worker(self):
+        """Startup sync: which cards are already in the cart?"""
+        async with self._cart_session() as session:
+            items = await self._cart_items(session)
+            self._save_cart_cookies(session)
+        self.msg_queue.put(("cart_state",
+                            self._cart_names_from_state(items)))
 
     def _selected_cards(self):
         return [c for c in self.deck_cards
@@ -1116,9 +1255,8 @@ class CommanderApp:
 
     def start_add_to_cart(self):
         if self.cart_thread and self.cart_thread.is_alive():
-            messagebox.showwarning(
-                "Running", "Already adding to cart — check the browser "
-                "window.")
+            messagebox.showwarning("Running",
+                                   "A cart operation is already running.")
             return
         cards = self._selected_cards()
         if not cards:
@@ -1137,18 +1275,38 @@ class CommanderApp:
                                             c.get("set_name")) if s],
             })
         self.cart_btn.config(state="disabled")
-        self._set_status("Opening store…")
+        self._set_status("Adding to cart…")
         self.cart_thread = threading.Thread(
-            target=self._run_cart, args=(selections,), daemon=True)
+            target=self._run_cart_op,
+            args=(self._cart_add_worker(selections),), daemon=True)
         self.cart_thread.start()
 
-    def _run_cart(self, selections):
+    def start_clear_cart(self):
+        if self.cart_thread and self.cart_thread.is_alive():
+            return
+        # Also untick every selection checkbox
+        for c in self.deck_cards:
+            if c.get("_sel") is not None:
+                c["_sel"].set(False)
+        self._update_cart_button()
+        self._set_status("Clearing cart…")
+        self.cart_thread = threading.Thread(
+            target=self._run_cart_op,
+            args=(self._cart_clear_worker(),), daemon=True)
+        self.cart_thread.start()
+
+    def _refresh_cart(self):
+        threading.Thread(target=self._run_cart_op,
+                         args=(self._cart_refresh_worker(),),
+                         daemon=True).start()
+
+    def _run_cart_op(self, coro):
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._cart_worker(selections))
+            loop.run_until_complete(coro)
         except Exception as e:
-            self.msg_queue.put(("cart_error", f"Add to cart failed: {e}"))
+            self.msg_queue.put(("cart_error", f"Cart operation failed: {e}"))
         finally:
             loop.close()
             self.msg_queue.put(("cart_finished", None))
@@ -1198,6 +1356,7 @@ class CommanderApp:
                     messagebox.showerror("Error", payload)
                 elif kind == "finished":
                     self.build_btn.config(state="normal")
+                    self._set_cancel_mode(running=False)
                 elif kind == "logo":
                     self._set_logo_from_bytes(payload)
                 elif kind == "decklist":
@@ -1210,11 +1369,15 @@ class CommanderApp:
                     messagebox.showerror("Import failed", payload)
                 elif kind == "import_finished":
                     self.import_btn.config(state="normal")
+                elif kind == "cart_state":
+                    self.cart_names = payload
+                    if self.deck_cards:
+                        self._redisplay()
                 elif kind == "cart_done":
                     added, total, problems = payload
                     self._set_status(
-                        f"Cart: {added}/{total} added — finish checkout in "
-                        "the browser window")
+                        f"Cart: {added}/{total} added — sign in on the "
+                        "store page to check out")
                     if problems:
                         messagebox.showwarning(
                             "Add to Cart",
@@ -1366,6 +1529,9 @@ class CommanderApp:
                 font=FONT_SMALL, cursor="hand2").pack(side="left", padx=4)
         tk.Label(bottom, text=qty_text, font=FONT_SMALL, bg=C["card"],
                  fg=C["muted"]).pack(side="right", padx=6)
+        if normalize_card_name(card["name"]) in self.cart_names:
+            tk.Label(frame, text="✓ IN CART", font=("Segoe UI", 8, "bold"),
+                     bg=C["card"], fg=C["green"]).pack(pady=(0, 3))
 
     def _render_name_card(self, card, idx, per_row):
         frame = tk.Frame(self.card_frame, bg=C["card"], padx=8, pady=5)
@@ -1396,6 +1562,9 @@ class CommanderApp:
         name_lbl.bind("<Enter>",
                       lambda e: name_lbl.config(fg=C["accent_hi"]))
         name_lbl.bind("<Leave>", lambda e: name_lbl.config(fg=C["text"]))
+        if normalize_card_name(card["name"]) in self.cart_names:
+            tk.Label(frame, text="✓ IN CART", font=("Segoe UI", 8, "bold"),
+                     bg=C["card"], fg=C["green"]).pack(side="right", padx=4)
         if card.get("image_bytes"):
             HoverPreview(name_lbl, card["image_bytes"])
 
