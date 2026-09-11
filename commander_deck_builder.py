@@ -56,7 +56,7 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
@@ -478,10 +478,8 @@ class CommanderApp:
         self.cancel_event = threading.Event()
         self.build_thread = None
         self.import_thread = None
-        self.cart_thread = None
         self.update_thread = None
         self.msg_queue = queue.Queue()
-        self.cart_names = set()  # normalized names currently in the cart
         self.show_images = tk.BooleanVar(value=False)  # text mode default
         self.import_mode = tk.BooleanVar(value=False)
         self._logo_photo = None
@@ -495,10 +493,12 @@ class CommanderApp:
         self.root.after(100, self._process_queue)
         self.root.after(3000, self._auto_update_check)
 
-        # Indicators are purely app-side: restore them from the local record
-        self.cart_names = self._local_cart_names()
-        if self.cart_names:
-            self._set_status(f"{len(self.cart_names)} card(s) in cart")
+        # Old website-cart caches are no longer used — clean them up
+        for stale in (CART_COOKIE_FILE, CART_STATE_FILE):
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ---- Style / GUI ----
 
@@ -1102,11 +1102,21 @@ class CommanderApp:
                 for item in items:
                     base = strip_listing_suffixes(item.get("name", ""))
                     if normalize_card_name(base) in targets:
+                        url = ""
+                        if all(item.get(k) for k in
+                               ("productLineUrlName", "setUrlName",
+                                "productUrlName", "id")):
+                            url = (f"{STORE_BASE}/catalog/"
+                                   f"{item['productLineUrlName']}/"
+                                   f"{item['setUrlName']}/"
+                                   f"{item['productUrlName']}/"
+                                   f"{item['id']}")
                         matched.append({
                             "id": item.get("id"),
                             "name": item.get("name", ""),
                             "setName": item.get("setName") or "",
                             "lowestPrice": item.get("lowestPrice"),
+                            "url": url,
                         })
                 offset += len(items)
                 if not items or offset >= products.get("totalItems", 0):
@@ -1188,243 +1198,50 @@ class CommanderApp:
             return v if isinstance(v, (int, float)) else float("inf")
         return min(products, key=price) if products else None
 
-    @staticmethod
-    def _pick_sku(skus, want_foil):
-        """Cheapest available SKU, preferring the requested finish."""
-        avail = [s for s in skus if (s.get("quantity") or 0) > 0]
-        if not avail:
-            return None
-        def price(s):
-            v = s.get("price")
-            return v if isinstance(v, (int, float)) else float("inf")
-        matching = [s for s in avail if bool(s.get("isFoil")) == want_foil]
-        return min(matching or avail, key=price)
-
-    # The store cart is a plain HTTP API tied to a session cookie. The app
-    # keeps its own persistent cart session (no Playwright involved) and
-    # opens the user's DEFAULT browser on the store's checkout handoff URL.
-
-    def _cart_session(self):
-        jar = aiohttp.CookieJar()
-        if CART_COOKIE_FILE.exists():
-            try:
-                jar.load(str(CART_COOKIE_FILE))
-            except Exception:
-                pass
-        return aiohttp.ClientSession(headers=STORE_HEADERS, cookie_jar=jar)
-
-    @staticmethod
-    def _save_cart_cookies(session):
-        try:
-            session.cookie_jar.save(str(CART_COOKIE_FILE))
-        except Exception:
-            pass
-
-    # The "in cart" indicators are purely app-side: a local list of card
-    # names the user added through the app. The website's cart session is
-    # only touched when adding (Add to Cart) or clearing (Clear Cart).
-
-    @staticmethod
-    def _load_cart_state():
-        """Local list of card display names marked as in-cart."""
-        try:
-            data = json.loads(CART_STATE_FILE.read_text("utf-8"))
-        except Exception:
-            return []
-        if isinstance(data, dict):
-            if isinstance(data.get("names"), list):
-                return [str(n) for n in data["names"]]
-            # legacy sku -> {name} format
-            return [v.get("name") for v in data.values()
-                    if isinstance(v, dict) and v.get("name")]
-        return []
-
-    @staticmethod
-    def _save_cart_state(names):
-        try:
-            CART_STATE_FILE.write_text(
-                json.dumps({"names": sorted(set(names))}), "utf-8")
-        except OSError:
-            pass
-
-    @staticmethod
-    async def _cart_items(session):
-        """Current items in the store cart: [{skuId, quantity, ...}]."""
-        try:
-            async with session.get(
-                    f"{STORE_BASE}/api/cart",
-                    timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status != 200:
-                    return []
-                data = await r.json()
-                return data.get("cartItems") or []
-        except Exception:
-            return []
-
-    def _local_cart_names(self):
-        """Normalized in-cart names from the app's own record."""
-        return {normalize_card_name(n) for n in self._load_cart_state()}
-
-    async def _cart_checkout_url(self, session):
-        """The store's sign-in/checkout URL for this cart session."""
-        try:
-            async with session.get(f"{STORE_BASE}/tcgplayer/cart",
-                                   allow_redirects=False,
-                                   timeout=aiohttp.ClientTimeout(
-                                       total=15)) as r:
-                loc = r.headers.get("Location")
-                if loc:
-                    return loc
-        except Exception:
-            pass
-        return f"{STORE_BASE}/tcgplayer/cart"
-
-    async def _cart_add_worker(self, selections):
-        added, problems = 0, []
-        added_names = []
-        async with self._cart_session() as session:
-            for i, sel in enumerate(selections):
-                self.msg_queue.put((
-                    "status",
-                    f"Adding to cart… {i + 1}/{len(selections)}"))
-                try:
-                    product = self._pick_product(sel["products"],
-                                                 sel["prefer_sets"])
-                    if not product or not product.get("id"):
-                        problems.append(f"{sel['name']}: no listing found")
-                        continue
-                    async with session.get(
-                            f"{STORE_BASE}/api/inventory/skus"
-                            f"?productIds={product['id']}") as r:
-                        if r.status != 200:
-                            problems.append(
-                                f"{sel['name']}: sku lookup failed")
-                            continue
-                        groups = await r.json()
-                    skus = groups[0].get("skus", []) if groups else []
-                    sku = self._pick_sku(skus, sel["foil"])
-                    if not sku:
-                        problems.append(f"{sel['name']}: sold out")
-                        continue
-                    qty = min(sel["qty"], sku.get("quantity") or 1)
-                    async with session.post(
-                            f"{STORE_BASE}/api/cart/items",
-                            json={"skuId": sku["skuId"],
-                                  "storePriceCustomId":
-                                      sku.get("storePriceCustomId") or None,
-                                  "condition": sku.get("conditionName",
-                                                       "Near Mint"),
-                                  "quantity": qty}) as r:
-                        body = {}
-                        try:
-                            body = await r.json()
-                        except Exception:
-                            pass
-                        if r.status == 200 and not body.get("errors"):
-                            added += 1
-                            added_names.append(sel["name"])
-                            if qty < sel["qty"]:
-                                problems.append(
-                                    f"{sel['name']}: only {qty} of "
-                                    f"{sel['qty']} available")
-                        else:
-                            problems.append(
-                                f"{sel['name']}: store rejected add")
-                except Exception as e:
-                    problems.append(f"{sel['name']}: {e}")
-
-            checkout = await self._cart_checkout_url(session)
-            self._save_cart_cookies(session)
-
-        # Record locally — indicators are app-side only
-        names = self._load_cart_state() + added_names
-        self._save_cart_state(names)
-        self.msg_queue.put(("cart_state",
-                            {normalize_card_name(n) for n in names}))
-        self.msg_queue.put(("cart_done", (added, len(selections), problems)))
-        if added:
-            webbrowser.open(checkout)  # user's default browser
-
-    async def _cart_clear_worker(self):
-        """Clear the in-app indicators and (best effort) the website cart."""
-        try:
-            async with self._cart_session() as session:
-                items = await self._cart_items(session)
-                for item in items:
-                    try:
-                        await session.post(
-                            f"{STORE_BASE}/api/cart/items",
-                            json={"skuId": item.get("skuId"),
-                                  "storePriceCustomId":
-                                      item.get("storePriceCustomId"),
-                                  "condition": item.get("condition",
-                                                        "Near Mint"),
-                                  "quantity": 0})
-                    except Exception:
-                        pass
-                self._save_cart_cookies(session)
-        except Exception:
-            pass  # website unreachable: indicators still clear locally
-        self._save_cart_state([])
-        self.msg_queue.put(("cart_state", set()))
-        self.msg_queue.put(("status", "Cart cleared"))
+    # The cart is purely in-app: ticking a card's checkbox marks it
+    # "added to cart" instantly. The website is never called in the
+    # background — the Add to Cart button only OPENS store product pages
+    # in the default browser, where the user adds items as a guest and
+    # signs in at checkout.
 
     def _selected_cards(self):
         return [c for c in self.deck_cards
                 if c.get("_sel") is not None and c["_sel"].get()]
 
     def start_add_to_cart(self):
-        if self.cart_thread and self.cart_thread.is_alive():
-            messagebox.showwarning("Running",
-                                   "A cart operation is already running.")
-            return
+        """Open the store page for every ticked card in the default
+        browser (guest cart on the website; sign in at checkout)."""
         cards = self._selected_cards()
         if not cards:
             messagebox.showwarning(
                 "Nothing selected",
                 "Tick the checkbox on the cards you want first.")
             return
-        selections = []
+        max_tabs = 15
+        if len(cards) > max_tabs and not messagebox.askyesno(
+                "Open pages",
+                f"This will open {len(cards)} browser tabs. Continue?"):
+            return
+        opened = 0
         for c in cards:
-            selections.append({
-                "name": c["name"],
-                "qty": c["qty"],
-                "foil": bool(c.get("foil")),
-                "products": c.get("stock_products") or [],
-                "prefer_sets": [s for s in (c.get("displayed_set_name"),
-                                            c.get("set_name")) if s],
-            })
-        self.cart_btn.config(state="disabled")
-        self._set_status("Adding to cart…")
-        self.cart_thread = threading.Thread(
-            target=self._run_cart_op,
-            args=(self._cart_add_worker(selections),), daemon=True)
-        self.cart_thread.start()
+            prefer = [s for s in (c.get("displayed_set_name"),
+                                  c.get("set_name")) if s]
+            product = self._pick_product(c.get("stock_products") or [],
+                                         prefer)
+            url = (product or {}).get("url") or store_search_url(c["name"])
+            webbrowser.open(url)
+            opened += 1
+        self._set_status(
+            f"Opened {opened} store page(s) — click Add to Cart on each")
 
     def start_clear_cart(self):
-        if self.cart_thread and self.cart_thread.is_alive():
-            return
-        # Also untick every selection checkbox
+        """Clear every in-app 'added to cart' mark."""
         for c in self.deck_cards:
             if c.get("_sel") is not None:
                 c["_sel"].set(False)
         self._update_cart_button()
-        self._set_status("Clearing cart…")
-        self.cart_thread = threading.Thread(
-            target=self._run_cart_op,
-            args=(self._cart_clear_worker(),), daemon=True)
-        self.cart_thread.start()
-
-    def _run_cart_op(self, coro):
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(coro)
-        except Exception as e:
-            self.msg_queue.put(("cart_error", f"Cart operation failed: {e}"))
-        finally:
-            loop.close()
-            self.msg_queue.put(("cart_finished", None))
+        self._redisplay()
+        self._set_status("Cart cleared")
 
     def _toggle_select_all(self):
         stockable = [c for c in self.deck_cards if c.get("in_stock")]
@@ -1434,12 +1251,19 @@ class CommanderApp:
             if c.get("_sel") is None:
                 c["_sel"] = tk.BooleanVar(master=self.root, value=False)
             c["_sel"].set(not all_on)
-        self._update_cart_button()
+        self._on_buy_toggle()
 
     def _sel_var(self, card):
         if card.get("_sel") is None:
             card["_sel"] = tk.BooleanVar(master=self.root, value=False)
         return card["_sel"]
+
+    def _on_buy_toggle(self):
+        """Checkbox changed: update the button count and the green
+        'added to cart' indicators immediately."""
+        self._update_cart_button()
+        if self.deck_cards:
+            self._redisplay()
 
     def _update_cart_button(self):
         n = len(self._selected_cards())
@@ -1484,28 +1308,6 @@ class CommanderApp:
                     messagebox.showerror("Import failed", payload)
                 elif kind == "import_finished":
                     self.import_btn.config(state="normal")
-                elif kind == "cart_state":
-                    self.cart_names = payload
-                    if payload:
-                        self._set_status(f"{len(payload)} card(s) in cart")
-                    if self.deck_cards:
-                        self._redisplay()
-                elif kind == "cart_done":
-                    added, total, problems = payload
-                    self._set_status(
-                        f"Cart: {added}/{total} added — sign in on the "
-                        "store page to check out")
-                    if problems:
-                        messagebox.showwarning(
-                            "Add to Cart",
-                            f"Added {added} of {total} cards.\n\nIssues:\n"
-                            + "\n".join(problems[:15]))
-                elif kind == "cart_error":
-                    self._set_status("Add to cart failed")
-                    messagebox.showerror("Add to Cart", payload)
-                elif kind == "cart_finished":
-                    self.cart_btn.config(state="normal")
-                    self._update_cart_button()
                 elif kind == "update_available":
                     self._set_status(f"Update available: v{payload}")
                     if messagebox.askyesno(
@@ -1598,7 +1400,7 @@ class CommanderApp:
 
         link = store_search_url(card["name"])
         widget = None
-        in_cart = normalize_card_name(card["name"]) in self.cart_names
+        in_cart = bool(card.get("_sel") is not None and card["_sel"].get())
         # cached thumbnail; rebuilt when the in-cart state changes
         photo = (card.get("_photo")
                  if card.get("_photo_cart") == in_cart else None)
@@ -1646,12 +1448,13 @@ class CommanderApp:
         if card.get("in_stock"):
             tk.Checkbutton(
                 bottom, text="Buy", variable=self._sel_var(card),
-                command=self._update_cart_button, bg=C["card"],
+                command=self._on_buy_toggle, bg=C["card"],
                 fg=C["text"], activebackground=C["card"],
                 activeforeground=C["text"], selectcolor=C["input_bg"],
                 font=FONT_SMALL, cursor="hand2").pack(side="left", padx=4)
         if in_cart:
-            tk.Label(bottom, text="in cart", font=("Segoe UI", 9, "bold"),
+            tk.Label(bottom, text="added to cart",
+                     font=("Segoe UI", 9, "bold"),
                      bg=C["card"], fg=C["green"]).pack(side="left", padx=2)
         tk.Label(bottom, text=qty_text, font=FONT_SMALL, bg=C["card"],
                  fg=C["muted"]).pack(side="right", padx=6)
@@ -1664,7 +1467,7 @@ class CommanderApp:
         if card.get("in_stock"):
             tk.Checkbutton(
                 frame, variable=self._sel_var(card),
-                command=self._update_cart_button, bg=C["card"],
+                command=self._on_buy_toggle, bg=C["card"],
                 activebackground=C["card"], selectcolor=C["input_bg"],
                 cursor="hand2").pack(side="left")
 
@@ -1685,8 +1488,9 @@ class CommanderApp:
         name_lbl.bind("<Enter>",
                       lambda e: name_lbl.config(fg=C["accent_hi"]))
         name_lbl.bind("<Leave>", lambda e: name_lbl.config(fg=C["text"]))
-        if normalize_card_name(card["name"]) in self.cart_names:
-            tk.Label(frame, text="in cart", font=("Segoe UI", 10, "bold"),
+        if card.get("_sel") is not None and card["_sel"].get():
+            tk.Label(frame, text="added to cart",
+                     font=("Segoe UI", 10, "bold"),
                      bg=C["card"], fg=C["green"]).pack(side="left", padx=6)
         if card.get("image_bytes"):
             HoverPreview(name_lbl, card["image_bytes"])
