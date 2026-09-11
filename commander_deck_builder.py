@@ -56,7 +56,7 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.0.1"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
@@ -1237,10 +1237,10 @@ class CommanderApp:
     def start_clear_cart(self):
         """Clear every in-app 'added to cart' mark."""
         for c in self.deck_cards:
-            if c.get("_sel") is not None:
+            if c.get("_sel") is not None and c["_sel"].get():
                 c["_sel"].set(False)
+                self._refresh_card(c)
         self._update_cart_button()
-        self._redisplay()
         self._set_status("Cart cleared")
 
     def _toggle_select_all(self):
@@ -1250,20 +1250,33 @@ class CommanderApp:
         for c in stockable:
             if c.get("_sel") is None:
                 c["_sel"] = tk.BooleanVar(master=self.root, value=False)
-            c["_sel"].set(not all_on)
-        self._on_buy_toggle()
+            if c["_sel"].get() == all_on:  # only cards actually changing
+                c["_sel"].set(not all_on)
+                self._refresh_card(c)
+        self._update_cart_button()
 
     def _sel_var(self, card):
         if card.get("_sel") is None:
             card["_sel"] = tk.BooleanVar(master=self.root, value=False)
         return card["_sel"]
 
-    def _on_buy_toggle(self):
-        """Checkbox changed: update the button count and the green
-        'added to cart' indicators immediately."""
+    def _on_buy_toggle(self, card):
+        """One checkbox changed: update only that card's row/tile."""
         self._update_cart_button()
-        if self.deck_cards:
+        self._refresh_card(card)
+
+    def _refresh_card(self, card):
+        """Redraw a single card's frame in place (no full-grid rebuild)."""
+        frame = card.get("_frame")
+        if frame is None or not frame.winfo_exists():
             self._redisplay()
+            return
+        for w in frame.winfo_children():
+            w.destroy()
+        if card.get("_frame_mode") == "image":
+            self._fill_image_card(frame, card)
+        else:
+            self._fill_name_card(frame, card)
 
     def _update_cart_button(self):
         n = len(self._selected_cards())
@@ -1397,7 +1410,11 @@ class CommanderApp:
         frame = tk.Frame(self.card_frame, bg=C["card"], bd=1,
                          relief="solid", highlightthickness=0)
         frame.grid(row=idx // per_row, column=idx % per_row, padx=6, pady=6)
+        card["_frame"] = frame
+        card["_frame_mode"] = "image"
+        self._fill_image_card(frame, card)
 
+    def _fill_image_card(self, frame, card):
         link = store_search_url(card["name"])
         widget = None
         in_cart = bool(card.get("_sel") is not None and card["_sel"].get())
@@ -1448,7 +1465,8 @@ class CommanderApp:
         if card.get("in_stock"):
             tk.Checkbutton(
                 bottom, text="Buy", variable=self._sel_var(card),
-                command=self._on_buy_toggle, bg=C["card"],
+                command=lambda c=card: self._on_buy_toggle(c),
+                bg=C["card"],
                 fg=C["text"], activebackground=C["card"],
                 activeforeground=C["text"], selectcolor=C["input_bg"],
                 font=FONT_SMALL, cursor="hand2").pack(side="left", padx=4)
@@ -1463,11 +1481,16 @@ class CommanderApp:
         frame = tk.Frame(self.card_frame, bg=C["card"], padx=8, pady=5)
         frame.grid(row=idx // per_row, column=idx % per_row,
                    padx=4, pady=3, sticky="ew")
+        card["_frame"] = frame
+        card["_frame_mode"] = "name"
+        self._fill_name_card(frame, card)
 
+    def _fill_name_card(self, frame, card):
         if card.get("in_stock"):
             tk.Checkbutton(
                 frame, variable=self._sel_var(card),
-                command=self._on_buy_toggle, bg=C["card"],
+                command=lambda c=card: self._on_buy_toggle(c),
+                bg=C["card"],
                 activebackground=C["card"], selectcolor=C["input_bg"],
                 cursor="hand2").pack(side="left")
 
