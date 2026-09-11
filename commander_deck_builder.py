@@ -26,6 +26,10 @@ import aiohttp
 MAX_CARDS = 100
 CONCURRENCY_LIMIT = 6
 SCRYFALL_CARD = "https://api.scryfall.com/cards/named?fuzzy="
+# Batch lookup: 75 cards per call, so a whole deck costs ~2 API requests
+# instead of one per card (which tripped Scryfall's rate budget and made
+# checks freeze for 60s at a time).
+SCRYFALL_COLLECTION = "https://api.scryfall.com/cards/collection"
 # Scryfall asks for <=10 requests/sec with UA + Accept headers; going
 # faster returns 429s, which was breaking card images on big decks.
 SCRYFALL_MIN_INTERVAL = 0.12
@@ -52,7 +56,7 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
@@ -891,6 +895,87 @@ class CommanderApp:
             url += "&set=" + urllib.parse.quote(set_code)
         return await self._scryfall_get(session, url)
 
+    async def _scryfall_post(self, session, url, payload):
+        """Rate-limited Scryfall POST with the same 429 handling."""
+        for attempt in range(6):
+            if self.cancel_event.is_set():
+                return None
+            await self._scryfall_throttle()
+            status, retry_after = None, None
+            try:
+                async with session.post(
+                        url, json=payload, headers=SCRYFALL_HEADERS,
+                        timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    status = r.status
+                    if status == 200:
+                        return await r.json()
+                    retry_after = r.headers.get("Retry-After")
+            except Exception:
+                pass
+            if status == 429:
+                try:
+                    delay = (min(float(retry_after), 60.0)
+                             if retry_after else 2.0)
+                except ValueError:
+                    delay = 2.0
+                self._scryfall_backoff(delay + 0.5)
+                continue
+            if status is not None:
+                return None
+            await asyncio.sleep(0.5 * (attempt + 1))
+        return None
+
+    async def _collection_lookup(self, session, idents):
+        """Batch card lookup. Returns a list aligned with idents
+        (Scryfall card object or None), 75 identifiers per request."""
+        out = [None] * len(idents)
+        for start in range(0, len(idents), 75):
+            chunk = idents[start:start + 75]
+            data = await self._scryfall_post(
+                session, SCRYFALL_COLLECTION, {"identifiers": chunk})
+            if not data:
+                continue
+            nf_keys = {(i.get("name", "").casefold(),
+                        i.get("set", "").casefold())
+                       for i in data.get("not_found", [])}
+            results = data.get("data", [])
+            ri = 0
+            for j, ident in enumerate(chunk):
+                key = (ident.get("name", "").casefold(),
+                       ident.get("set", "").casefold())
+                if key in nf_keys:
+                    continue
+                if ri < len(results):
+                    out[start + j] = results[ri]
+                    ri += 1
+        return out
+
+    async def _prefetch_scryfall(self, session, entries):
+        """Resolve every entry's card data in ~2 API calls total.
+
+        Attaches the Scryfall card object as entry['_scry'] (or None,
+        in which case the per-card fuzzy fallback kicks in later).
+        """
+        def ident(e, with_set):
+            d = {"name": e["name"]}
+            if with_set and e.get("set_code"):
+                d["set"] = e["set_code"].lower()
+            return d
+
+        results = await self._collection_lookup(
+            session, [ident(e, True) for e in entries])
+        for e, card in zip(entries, results):
+            e["_scry"] = card
+
+        # Entries whose requested set didn't exist: retry by name only
+        retry = [e for e in entries
+                 if e["_scry"] is None and e.get("set_code")]
+        if retry:
+            results = await self._collection_lookup(
+                session, [ident(e, False) for e in retry])
+            for e, card in zip(retry, results):
+                e["_scry"] = card
+
     @staticmethod
     async def _fetch_card_image(session, data):
         """Download the 'normal' image for a Scryfall card object.
@@ -924,11 +1009,9 @@ class CommanderApp:
                 "foil": entry["foil"], "set_code": entry.get("set_code"),
                 "set_name": None, "cmc": 0, "type_line": "Unknown",
                 "image_bytes": None, "in_stock": False}
-        data = None
-        # Requested printing first ("Swamp (SIS)"), then any printing
-        if entry.get("set_code"):
-            data = await self._scryfall_named(session, entry["name"],
-                                              entry["set_code"])
+        # Card data comes from the batch prefetch; the per-card fuzzy
+        # lookup only runs for misspelled names the batch couldn't match.
+        data = entry.get("_scry")
         if data is None:
             data = await self._scryfall_named(session, entry["name"])
         if data:
@@ -1035,6 +1118,8 @@ class CommanderApp:
 
         headers = {"User-Agent": "CommanderDeckBuilder/2.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
+            self.msg_queue.put(("status", "Looking up cards…"))
+            await self._prefetch_scryfall(session, entries)
             sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
             async def process(entry):
