@@ -56,7 +56,7 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
@@ -1486,6 +1486,9 @@ class CommanderApp:
                     self.import_btn.config(state="normal")
                 elif kind == "cart_state":
                     self.cart_names = payload
+                    if payload:
+                        self._set_status(
+                            f"{len(payload)} card(s) in store cart")
                     if self.deck_cards:
                         self._redisplay()
                 elif kind == "cart_done":
