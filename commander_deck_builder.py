@@ -58,11 +58,11 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
-UPDATE_INTERVAL_S = 24 * 60 * 60  # check once a day
+UPDATE_INTERVAL_S = 6 * 60 * 60  # re-check every 6h while running
 UPDATE_EXE_NAME = "VamarenStockChecker.exe"
 
 
@@ -719,13 +719,9 @@ class CommanderApp:
                 self.msg_queue.put(("update_error", str(e)))
 
     def _auto_update_check(self):
-        """Runs shortly after startup, then once a day while open."""
-        try:
-            last = int(UPDATE_STAMP_FILE.read_text().strip())
-        except (OSError, ValueError):
-            last = 0
-        if time.time() - last >= UPDATE_INTERVAL_S:
-            self.check_for_updates(manual=False)
+        """Checks on every launch, then every few hours while open, so
+        published updates reach users nearly immediately."""
+        self.check_for_updates(manual=False)
         self.root.after(UPDATE_INTERVAL_S * 1000, self._auto_update_check)
 
     # ---- Self update (download new exe, swap, restart) ----
