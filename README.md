@@ -30,9 +30,7 @@ pip install -r requirements.txt pyinstaller
 pyinstaller VamarenStockChecker.spec --noconfirm
 ```
 
-Or run directly: `python commander_deck_builder.py`
-(requires Python 3.10+; deck imports from Moxfield/Aetherhub additionally
-need `playwright install chromium`).
+Or run directly: `python commander_deck_builder.py` (requires Python 3.10+).
 
 ## License
 

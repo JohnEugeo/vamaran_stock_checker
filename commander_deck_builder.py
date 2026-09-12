@@ -58,7 +58,7 @@ STORE_HEADERS = {
 }
 
 APP_TITLE = "Vamaren Stock Checker"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 REPO_URL = "https://github.com/JohnEugeo/vamaran_stock_checker"
 VERSION_URL = ("https://raw.githubusercontent.com/JohnEugeo/"
                "vamaran_stock_checker/main/VERSION")
@@ -232,6 +232,10 @@ IMPORT_HEADERS = {
 }
 
 
+CURL_EXE = Path(os.environ.get("SystemRoot",
+                               r"C:\Windows")) / "System32" / "curl.exe"
+
+
 async def _http_text(session, url):
     """GET a URL, return (status, text)."""
     async with session.get(url, headers=IMPORT_HEADERS,
@@ -239,31 +243,45 @@ async def _http_text(session, url):
         return r.status, await r.text()
 
 
-async def _browser_fetch(url, wait_ms=2500):
-    """Fetch a page with headless Chromium (passes most bot checks).
+async def _curl_text(url, timeout=30):
+    """Fetch with Windows' built-in curl.exe.
 
-    Returns (status, body_text, html).
+    Its Schannel TLS stack looks like a real browser to Cloudflare, so
+    it reaches sites (Moxfield, Aetherhub, Deckstats) that block Python
+    HTTP clients — no Playwright/browser needed.
     """
+    if not CURL_EXE.exists():
+        return None, ""
+
+    def run():
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return subprocess.run(
+            [str(CURL_EXE), "-sL", "--compressed", "-A", BROWSER_UA,
+             "-m", str(timeout), "-H", "Accept: */*",
+             "-w", "\n%{http_code}", url],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", creationflags=flags)
+
+    r = await asyncio.to_thread(run)
+    body, _, code = r.stdout.rpartition("\n")
     try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        raise DeckImportError(
-            "Importing from this site needs the 'playwright' package:\n"
-            "pip install playwright && playwright install chromium")
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        try:
-            ctx = await browser.new_context(user_agent=BROWSER_UA)
-            page = await ctx.new_page()
-            resp = await page.goto(url, timeout=30000,
-                                   wait_until="domcontentloaded")
-            if wait_ms:
-                await page.wait_for_timeout(wait_ms)
-            body = await page.inner_text("body")
-            html = await page.content()
-            return (resp.status if resp else 0), body, html
-        finally:
-            await browser.close()
+        return int(code.strip()), body
+    except ValueError:
+        return None, ""
+
+
+async def _http_text_robust(session, url):
+    """GET via aiohttp; fall back to curl.exe when bot-blocked."""
+    status, text = None, ""
+    try:
+        status, text = await _http_text(session, url)
+    except Exception:
+        pass
+    if status not in (200,):
+        c_status, c_text = await _curl_text(url)
+        if c_status is not None:
+            return c_status, c_text
+    return status, text
 
 
 def _looks_like_decklist(text):
@@ -275,10 +293,12 @@ async def _import_moxfield(session, url):
     if not m:
         raise DeckImportError("Could not find a deck id in that Moxfield URL.")
     api = f"https://api2.moxfield.com/v2/decks/all/{m.group(1)}"
-    # Moxfield's API blocks plain HTTP clients; go through the browser.
-    status, body, _ = await _browser_fetch(api, wait_ms=500)
+    # Moxfield's API bot-blocks Python HTTP; curl.exe fallback gets through
+    status, body = await _http_text_robust(session, api)
     if status == 404:
         raise DeckImportError("Moxfield deck not found (is it private?).")
+    if status != 200:
+        raise DeckImportError(f"Moxfield returned HTTP {status}.")
     try:
         data = json.loads(body)
     except ValueError:
@@ -296,7 +316,7 @@ async def _import_archidekt(session, url):
     m = re.search(r"archidekt\.com/decks/(\d+)", url)
     if not m:
         raise DeckImportError("Could not find a deck id in that Archidekt URL.")
-    status, text = await _http_text(
+    status, text = await _http_text_robust(
         session, f"https://archidekt.com/api/decks/{m.group(1)}/")
     if status == 404:
         raise DeckImportError("Archidekt deck not found (is it private?).")
@@ -322,7 +342,7 @@ async def _import_mtggoldfish(session, url):
     deck_id = m.group(1) if m else None
     if not deck_id:
         # Archetype pages embed a /deck/download/<id> link
-        status, html = await _http_text(session, url)
+        status, html = await _http_text_robust(session, url)
         if status != 200:
             raise DeckImportError(f"MTGGoldfish returned HTTP {status}.")
         m = re.search(r"/deck/download/(\d+)", html)
@@ -330,7 +350,7 @@ async def _import_mtggoldfish(session, url):
             raise DeckImportError(
                 "Could not find a decklist on that MTGGoldfish page.")
         deck_id = m.group(1)
-    status, text = await _http_text(
+    status, text = await _http_text_robust(
         session, f"https://www.mtggoldfish.com/deck/download/{deck_id}")
     if status != 200 or not _looks_like_decklist(text):
         raise DeckImportError("Could not download that MTGGoldfish deck.")
@@ -338,28 +358,30 @@ async def _import_mtggoldfish(session, url):
 
 
 async def _import_aetherhub(session, url):
-    if "aetherhub.com/Deck/" not in url and "aetherhub.com/deck/" not in url:
+    m = re.search(r"aetherhub\.com/Deck/[\w-]*?(\d+)(?:[/?#]|$)", url,
+                  re.IGNORECASE)
+    if not m:
         raise DeckImportError("That does not look like an Aetherhub deck URL.")
-    status, _, html = await _browser_fetch(url, wait_ms=3500)
+    # Their MTGO export endpoint returns a plain text decklist
+    status, text = await _http_text_robust(
+        session, f"https://aetherhub.com/Deck/MtgoDeckExport/{m.group(1)}")
+    if status == 200 and _looks_like_decklist(text):
+        return text.strip()
+    # Fallback: scrape the deck page (one card link per copy)
+    status, html = await _http_text_robust(session, url)
     if status != 200:
         raise DeckImportError(f"Aetherhub returned HTTP {status}.")
-    # The visual tab lists one card link per copy
-    m = re.search(r'id="tab_visual_\d+"(.*?)(?:<div class="tab-pane|$)',
-                  html, re.S)
-    if not m:
-        raise DeckImportError("Could not find the decklist on that page.")
-    names = re.findall(r'data-card-name="([^"]+)"', m.group(1))
+    m2 = re.search(r'id="tab_visual_\d+"(.*?)(?:<div class="tab-pane|$)',
+                   html, re.S)
+    names = re.findall(r'data-card-name="([^"]+)"', m2.group(1)) if m2 else []
     if not names:
-        raise DeckImportError("That Aetherhub deck appears to be empty.")
+        raise DeckImportError("Could not find the decklist on that page.")
     return "\n".join(f"{qty} {name}" for name, qty in Counter(names).items())
 
 
 async def _import_tappedout(session, url):
     base = url.split("?")[0].rstrip("/")
-    txt_url = base + "/?fmt=txt"
-    status, text = await _http_text(session, txt_url)
-    if status != 200 or not _looks_like_decklist(text):
-        status, text, _ = await _browser_fetch(txt_url)
+    status, text = await _http_text_robust(session, base + "/?fmt=txt")
     if status == 200 and _looks_like_decklist(text):
         return text.strip()
     raise DeckImportError(
@@ -367,17 +389,30 @@ async def _import_tappedout(session, url):
         "Open the deck, use Export > Text, and paste the list instead.")
 
 
+# Deck entries embedded in Deckstats page JSON:
+#   {"zone":"main",...,"amount":2,...,"name":"Dark Ritual",...}
+_DECKSTATS_ENTRY = re.compile(
+    r'"zone":"([^"]+)"[^{}]*?"amount":(\d+)[^{}]*?"name":"((?:[^"\\]|\\.)*)"')
+
+
 async def _import_deckstats(session, url):
-    for candidate in (url + ("&" if "?" in url else "?") + "export_txt=1",):
-        status, text = await _http_text(session, candidate)
-        if status == 200 and _looks_like_decklist(text):
-            return text.strip()
-        status, text, _ = await _browser_fetch(candidate)
-        if status == 200 and _looks_like_decklist(text):
-            return text.strip()
-    raise DeckImportError(
-        "Deckstats is blocking automated access right now.\n"
-        "Open the deck, use Export, and paste the list instead.")
+    status, html = await _http_text_robust(session, url.split("?")[0])
+    if status != 200:
+        raise DeckImportError(f"Deckstats returned HTTP {status}.")
+    lines = []
+    for zone, amount, raw_name in _DECKSTATS_ENTRY.findall(html):
+        if zone.casefold().startswith("maybe"):
+            continue
+        try:
+            name = json.loads(f'"{raw_name}"')
+        except ValueError:
+            continue
+        lines.append(f"{amount} {name}")
+    if not lines:
+        raise DeckImportError(
+            "Could not find the decklist on that Deckstats page.\n"
+            "Open the deck, use Export, and paste the list instead.")
+    return "\n".join(lines)
 
 
 DECK_IMPORTERS = {
